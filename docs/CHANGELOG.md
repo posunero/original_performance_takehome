@@ -2,7 +2,117 @@
 
 ## Version History
 
-### v9 - Prologue/Epilogue VLIW Packing (Current)
+### v12 - Index Computation Overlap (Current)
+**Cycles**: 2,736
+**Speedup**: 54.0x from baseline
+
+**Changes**:
+- Created `emit_idx_ops_by_step()` function to return ops organized by step for deferred emission
+- Added `prev_idx_steps` state variable to track pending idx ops from previous triple
+- Emit previous triple's idx step 0 (& ops) immediately after XOR (packs with XOR to fill 6 VALU)
+- Emit previous triple's idx steps 1-4 during hash stages 0-3 (hidden latency)
+- Allocated dedicated `s_idx_tmp[256]` scratch array for idx temp values to avoid buffer conflicts
+- Final triple's idx ops emitted in epilogue before stores
+
+**Key insight**: Since consecutive triples use different scratch addresses (different chunks), their
+idx ops can execute in parallel. Triple N's idx ops can overlap with Triple N+1's execution:
+```
+Before (sequential):
+Triple N: XOR → Hash0-5 → IdxOps (5 cycles)
+Triple N+1: XOR → Hash0-5 → IdxOps (5 cycles)
+
+After (overlapped):
+Triple N: XOR → Hash0-5
+Triple N+1: [XOR + N.Idx0] → [Hash0 + N.Idx1] → [Hash1 + N.Idx2] → ... → IdxOps saved
+```
+
+**Critical fix**: Buffer reuse pattern (A/B/C then D/E/F) caused conflicts between prev_idx_steps
+and next triple's shallow ops (both using same buf[1]). Fixed by allocating dedicated scratch
+`s_idx_tmp` indexed by chunk instead of using buffer temps.
+
+**Savings**: 320 cycles (10.5% reduction from v11)
+
+---
+
+### v11 - Comprehensive VLIW Interleaving
+**Cycles**: 3,056
+**Speedup**: 48.3x from baseline
+
+**Changes**:
+- Created interleaved shallow emission functions (`emit_shallow_d0/d1/d2_interleaved()`)
+- Pre-compute all shallow ops for next triple before hash loop in interleaved order
+- Fill unused VALU slots during hash stages with shallow ops (3 slots available per stage)
+- Unified `emit_all_shallow_interleaved()` helper groups by depth and emits interleaved
+
+**Key insight**: Shallow ops for D1/D2 have internal dependencies within each buffer but are
+independent across buffers. Sequential per-buffer emission:
+```
+buf0: op0, op1, op2, op3   (4 ops, 3 cycles due to deps)
+buf1: op0, op1, op2, op3   (4 ops, 3 cycles)
+buf2: op0, op1, op2, op3   (4 ops, 3 cycles)
+Total: 9 cycles (VLIW can't pack across buffer boundaries)
+```
+
+Interleaved step-by-step emission:
+```
+Step 1: buf0.op0, buf1.op0, buf2.op0  (3 ops, 1 cycle - all independent)
+Step 2: buf0.op1, buf0.op2, buf1.op1, buf1.op2, buf2.op1, buf2.op2  (6 ops, 1 cycle)
+Step 3: buf0.op3, buf1.op3, buf2.op3  (3 ops, 1 cycle)
+Total: 3 cycles (VLIW packs across buffers)
+```
+
+**Breakdown of savings**:
+- Interleaved emission alone: 433 cycles (3580→3147)
+- Slot-filling during hash stages: 91 cycles (3147→3056)
+- Total savings: 524 cycles (14.6% reduction)
+
+**VALU utilization improved**:
+- Hash finals (stages 1, 3, 5): 3 VALU hash ops + 3 shallow ops = 6 VALU (full)
+- Fused stages (0, 2, 4): 3 VALU hash ops + 3 shallow ops = 6 VALU (full)
+- Shallow ops emitted immediately pack with hash ops instead of waiting
+
+---
+
+### v10 - Index Computation Interleaving
+**Cycles**: 3,580
+**Speedup**: 41.3x from baseline
+
+**Changes**:
+- Created `emit_idx_ops_interleaved()` function to emit index operations in optimal order
+- Instead of emitting all 6 ops for chunk0, then all 6 for chunk1, then all 6 for chunk2...
+- Now emit by step across chunks for better VLIW packing:
+  - Step 1: All `&` ops (C0.op1, C1.op1, C2.op1) - 3 VALU
+  - Step 2: All `+` and `*` ops (6 VALU) - independent destinations
+  - Step 3: All `+` ops for idx += tmp1 (3 VALU)
+  - Step 4: All `<` comparison ops (3 VALU)
+  - Step 5: All final `*` ops (3 VALU)
+
+**Key insight**: Sequential emission per chunk:
+```
+C0: op1, op2, op3, op4, op5, op6
+C1: op1, op2, op3, op4, op5, op6
+C2: op1, op2, op3, op4, op5, op6
+```
+The greedy VLIW packer couldn't see ahead to pack across chunks, resulting in ~12 cycles
+per triple instead of theoretical 5 cycles.
+
+**Interleaved emission**:
+```
+Step 1: C0.op1, C1.op1, C2.op1  → 1 cycle (3 VALU)
+Step 2: C0.op2, C0.op3, C1.op2, C1.op3, C2.op2, C2.op3  → 1 cycle (6 VALU)
+Step 3: C0.op4, C1.op4, C2.op4  → 1 cycle (3 VALU)
+Step 4: C0.op5, C1.op5, C2.op5  → 1 cycle (3 VALU)
+Step 5: C0.op6, C1.op6, C2.op6  → 1 cycle (3 VALU)
+Total: 5 cycles vs ~12 cycles before
+```
+
+**Savings**: 1,364 cycles (27.6% reduction)
+- ~7 cycles saved per triple × 170 triples = ~1,190 cycles
+- Additional savings from better overall packing
+
+---
+
+### v9 - Prologue/Epilogue VLIW Packing
 **Cycles**: 4,944
 **Speedup**: 29.9x from baseline
 
@@ -237,29 +347,36 @@ slots DURING hash computation). Even with hash fusion savings, net effect is +13
 
 2. ~~**Prologue/Epilogue VLIW packing**~~ - IMPLEMENTED in v9 (saved 56 cycles)
 
-3. **Loop instructions** - Use `cond_jump_rel` for iteration instead of full unrolling
+3. ~~**Index computation interleaving**~~ - IMPLEMENTED in v10 (saved 1,364 cycles!)
+
+4. ~~**Interleaved shallow computation**~~ - IMPLEMENTED in v11 (saved 524 cycles)
+
+5. **Loop instructions** - Use `cond_jump_rel` for iteration instead of full unrolling
    - Would reduce instruction memory footprint
    - May improve cache behavior
 
-4. **Interleaved shallow computation** - Do depth 0/1/2 node_val computation DURING hash finals
-   - Hash finals use 3 valu slots (for triple), leaving 3 free
-   - Could interleave shallow selection ops with hash finals
-   - Challenge: Complex dependency tracking
-
-5. **Interleaved prologue** - Overlap prologue vloads with tree value loading/broadcasting
+6. **Interleaved prologue** - Overlap prologue vloads with tree value loading/broadcasting
    - Currently prologue is sequential (but now with better VLIW packing)
    - Could overlap with initial setup operations
 
-6. **Better VLIW packing** - Analyze instruction stream for packing inefficiencies
-   - Current `build()` is greedy; might miss global optimizations
+7. **Hash stage parallel improvement** - Further optimize hash/gather overlap
 
 ## Performance Analysis
 
-Current bottlenecks at 4,944 cycles:
-- Hash stages: 12 cycles per triple (6 stages × 2 cycles: parallel + final)
-- Index computation: 5-cycle dependency chain
+Current bottlenecks at 3,056 cycles:
+- Hash stages: ~8 cycles per triple (6 stages, good packing)
+- Index computation: 5 cycles per triple (interleaved across chunks)
+- Shallow computation: ~1-3 cycles per triple (now interleaved with hash)
 - Prologue: ~38 cycles (6 alu + 32 load)
 - Epilogue: ~38 cycles (6 alu + 32 store)
 
-Theoretical minimum for triple: ~20 cycles × 171 triples = 3,420 cycles
-Current overhead: 4,944 - 3,420 = 1,524 cycles (prologue, epilogue, edge cases, packing inefficiency)
+Main loop analysis:
+- Main loop: 3,056 - 38 - 38 = ~2,980 cycles
+- Per triple: 2,980 / 170 ≈ 17.5 cycles/triple
+- Target: ~12-13 cycles/triple (to reach < 2,164)
+
+Theoretical minimum for triple: ~13 cycles × 170 triples = ~2,210 cycles (hash + idx)
+Current overhead: 3,056 - 2,210 = ~846 cycles (prologue, epilogue, XOR, edge cases)
+
+To reach < 2,164 cycles: need to save ~900+ more cycles
+- Need ~5 more cycles saved per triple, or major prologue/epilogue improvement

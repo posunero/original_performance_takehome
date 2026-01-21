@@ -196,6 +196,8 @@ class KernelBuilder:
         # Global scratch arrays for ALL batch idx/val (eliminates per-iteration memory access)
         s_idx = self.alloc_scratch("s_idx", batch_size)  # 256 words for all batch indices
         s_val = self.alloc_scratch("s_val", batch_size)  # 256 words for all batch values
+        # Dedicated temps for idx ops (one vector per chunk to avoid buffer conflicts during overlap)
+        s_idx_tmp = self.alloc_scratch("s_idx_tmp", batch_size)  # 256 words for idx temp values
 
         # Six buffers for triple processing (3 chunks at a time)
         # Reduced buffer layout: (v_node_val, v_tmp1, v_tmp2, gather_addrs, v_tmp3)
@@ -347,6 +349,93 @@ class KernelBuilder:
             ops.append(("valu", ("multiply_add", v_node_val, v_tmp1, v_tmp3, v_node_val)))  # + b1*val_high
             return ops
 
+        def emit_shallow_d0_interleaved(buffers_info):
+            """D0 is just 1 vbroadcast per buffer - all independent."""
+            ops = []
+            for buf, _ in buffers_info:
+                v_node_val = buf[0]
+                ops.append(("valu", ("vbroadcast", v_node_val, scalar_node_vals[0])))
+            return ops
+
+        def emit_shallow_d1_interleaved(buffers_info):
+            """D1 interleaved: 4 ops per buffer with internal dependencies."""
+            if not buffers_info:
+                return []
+            ops = []
+            # Step 1: All op0 (v_tmp1 = v_idx & 1)
+            for buf, chunk in buffers_info:
+                v_node_val, v_tmp1, v_tmp2, _, _ = buf
+                v_idx, _ = get_scratch_addrs(chunk)
+                ops.append(("valu", ("&", v_tmp1, v_idx, v_one)))
+            # Step 2: All op1 and op2 (depend on step 1)
+            for buf, chunk in buffers_info:
+                v_node_val, v_tmp1, v_tmp2, _, _ = buf
+                ops.append(("valu", ("*", v_node_val, v_tmp1, v_node_d1_1)))
+                ops.append(("valu", ("-", v_tmp2, v_one, v_tmp1)))
+            # Step 3: All op3 (depends on op1, op2)
+            for buf, chunk in buffers_info:
+                v_node_val, v_tmp1, v_tmp2, _, _ = buf
+                ops.append(("valu", ("multiply_add", v_node_val, v_tmp2, v_node_d1_2, v_node_val)))
+            return ops
+
+        def emit_shallow_d2_interleaved(buffers_info):
+            """D2 interleaved: 12 ops per buffer with complex dependencies."""
+            if not buffers_info:
+                return []
+            ops = []
+            # Step 1: All op0 (v_tmp1 = v_idx - 3)
+            for buf, chunk in buffers_info:
+                v_node_val, v_tmp1, v_tmp2, _, v_tmp3 = buf
+                v_idx, _ = get_scratch_addrs(chunk)
+                ops.append(("valu", ("-", v_tmp1, v_idx, v_three)))
+            # Step 2: op1 and op2
+            for buf, chunk in buffers_info:
+                v_node_val, v_tmp1, v_tmp2, _, v_tmp3 = buf
+                ops.append(("valu", ("&", v_tmp2, v_tmp1, v_one)))
+                ops.append(("valu", (">>", v_tmp1, v_tmp1, v_one)))
+            # Step 3: op3
+            for buf, chunk in buffers_info:
+                v_node_val, v_tmp1, v_tmp2, _, v_tmp3 = buf
+                ops.append(("valu", ("-", v_node_val, v_one, v_tmp2)))
+            # Step 4: op4 and op6
+            for buf, chunk in buffers_info:
+                v_node_val, v_tmp1, v_tmp2, _, v_tmp3 = buf
+                ops.append(("valu", ("*", v_node_val, v_node_val, v_node_d2[0])))
+                ops.append(("valu", ("-", v_tmp3, v_one, v_tmp2)))
+            # Step 5: op5 and op7
+            for buf, chunk in buffers_info:
+                v_node_val, v_tmp1, v_tmp2, _, v_tmp3 = buf
+                ops.append(("valu", ("multiply_add", v_node_val, v_tmp2, v_node_d2[1], v_node_val)))
+                ops.append(("valu", ("*", v_tmp3, v_tmp3, v_node_d2[2])))
+            # Step 6: op8 and op9
+            for buf, chunk in buffers_info:
+                v_node_val, v_tmp1, v_tmp2, _, v_tmp3 = buf
+                ops.append(("valu", ("multiply_add", v_tmp3, v_tmp2, v_node_d2[3], v_tmp3)))
+                ops.append(("valu", ("-", v_tmp2, v_one, v_tmp1)))
+            # Step 7: op10
+            for buf, chunk in buffers_info:
+                v_node_val, v_tmp1, v_tmp2, _, v_tmp3 = buf
+                ops.append(("valu", ("*", v_node_val, v_node_val, v_tmp2)))
+            # Step 8: op11
+            for buf, chunk in buffers_info:
+                v_node_val, v_tmp1, v_tmp2, _, v_tmp3 = buf
+                ops.append(("valu", ("multiply_add", v_node_val, v_tmp1, v_tmp3, v_node_val)))
+            return ops
+
+        def emit_all_shallow_interleaved(shallow_queue):
+            """shallow_queue: list of (depth, buf, chunk) tuples"""
+            d0_buffers = [(buf, chunk) for d, buf, chunk in shallow_queue if d == 0]
+            d1_buffers = [(buf, chunk) for d, buf, chunk in shallow_queue if d == 1]
+            d2_buffers = [(buf, chunk) for d, buf, chunk in shallow_queue if d == 2]
+            result = []
+            if d0_buffers:
+                result.extend(emit_shallow_d0_interleaved(d0_buffers))
+            if d1_buffers:
+                result.extend(emit_shallow_d1_interleaved(d1_buffers))
+            if d2_buffers:
+                result.extend(emit_shallow_d2_interleaved(d2_buffers))
+            return result
+
         def emit_hash_stage_parallel_ops(buf, chunk):
             v_node_val, v_tmp1, v_tmp2, gather_addrs, v_tmp3 = buf
             v_idx, v_val = get_scratch_addrs(chunk)
@@ -390,6 +479,72 @@ class KernelBuilder:
             ops.append(("valu", ("*", v_idx, v_idx, v_tmp1)))
             return ops
 
+        def emit_idx_ops_interleaved(chunks_info):
+            """
+            Emit index ops interleaved across chunks for better VLIW packing.
+            chunks_info: list of (v_idx, v_val, v_tmp1) tuples
+
+            Sequential emission gives suboptimal packing:
+              C0: op1, op2, op3, op4, op5, op6
+              C1: op1, op2, op3, op4, op5, op6
+              C2: op1, op2, op3, op4, op5, op6
+
+            Interleaved emission allows better bundling:
+              Step 1: C0.op1, C1.op1, C2.op1  (3 VALU)
+              Step 2: C0.op2, C0.op3, C1.op2, C1.op3, C2.op2, C2.op3  (6 VALU)
+              Step 3: C0.op4, C1.op4, C2.op4  (3 VALU)
+              Step 4: C0.op5, C1.op5, C2.op5  (3 VALU)
+              Step 5: C0.op6, C1.op6, C2.op6  (3 VALU)
+            """
+            ops = []
+
+            # Step 1: All & ops (val & 1) - independent, different destinations
+            for v_idx, v_val, v_tmp1 in chunks_info:
+                ops.append(("valu", ("&", v_tmp1, v_val, v_one)))
+
+            # Step 2: All + and * ops (can be parallel - different destinations)
+            for v_idx, v_val, v_tmp1 in chunks_info:
+                ops.append(("valu", ("+", v_tmp1, v_tmp1, v_one)))
+                ops.append(("valu", ("*", v_idx, v_idx, v_two)))
+
+            # Step 3: All + ops (idx += tmp1) - depends on steps 1-2
+            for v_idx, v_val, v_tmp1 in chunks_info:
+                ops.append(("valu", ("+", v_idx, v_idx, v_tmp1)))
+
+            # Step 4: All < ops (tmp1 = idx < n_nodes) - depends on step 3
+            for v_idx, v_val, v_tmp1 in chunks_info:
+                ops.append(("valu", ("<", v_tmp1, v_idx, v_n_nodes)))
+
+            # Step 5: All final * ops (idx *= tmp1) - depends on step 4
+            for v_idx, v_val, v_tmp1 in chunks_info:
+                ops.append(("valu", ("*", v_idx, v_idx, v_tmp1)))
+
+            return ops
+
+        def emit_idx_ops_by_step(chunks_info):
+            """
+            Return idx ops as 5 separate steps for deferred/interleaved emission.
+            Same content as emit_idx_ops_interleaved, but organized by step.
+            """
+            steps = [[] for _ in range(5)]
+            # Step 0: All & ops (val & 1) - 3 VALU
+            for v_idx, v_val, v_tmp1 in chunks_info:
+                steps[0].append(("valu", ("&", v_tmp1, v_val, v_one)))
+            # Step 1: All + and * ops - 6 VALU
+            for v_idx, v_val, v_tmp1 in chunks_info:
+                steps[1].append(("valu", ("+", v_tmp1, v_tmp1, v_one)))
+                steps[1].append(("valu", ("*", v_idx, v_idx, v_two)))
+            # Step 2: All + ops (idx += tmp1) - 3 VALU
+            for v_idx, v_val, v_tmp1 in chunks_info:
+                steps[2].append(("valu", ("+", v_idx, v_idx, v_tmp1)))
+            # Step 3: All < ops (tmp1 = idx < n_nodes) - 3 VALU
+            for v_idx, v_val, v_tmp1 in chunks_info:
+                steps[3].append(("valu", ("<", v_tmp1, v_idx, v_n_nodes)))
+            # Step 4: All final * ops (idx *= tmp1) - 3 VALU
+            for v_idx, v_val, v_tmp1 in chunks_info:
+                steps[4].append(("valu", ("*", v_idx, v_idx, v_tmp1)))
+            return steps
+
         def emit_node_val(buf, iter_num):
             """Emit node value computation - shallow for depths 0-2, gather otherwise."""
             chunk = iter_num % n_chunks
@@ -432,6 +587,9 @@ class KernelBuilder:
         if total_iterations > 2:
             instrs.extend(emit_node_val(buf_C, 2))
 
+        # Track pending idx ops from previous triple for overlap
+        prev_idx_steps = []
+
         iter_idx = 0
         while iter_idx < total_iterations:
             has_second = iter_idx + 1 < total_iterations
@@ -469,6 +627,21 @@ class KernelBuilder:
                 instrs.append(("valu", ("^", v_val1, v_val1, buf1[0])))
             if has_third:
                 instrs.append(("valu", ("^", v_val2, v_val2, buf2[0])))
+
+            # Emit previous triple's idx step 0 (& ops) - packs with XOR (6 VALU total)
+            if prev_idx_steps:
+                instrs.extend(prev_idx_steps[0])
+
+            # Pre-compute shallow ops for next triple (interleaved across buffers)
+            shallow_queue = []
+            if has_next_triple and depth_next0 <= 2:
+                shallow_queue.append((depth_next0, buf_next0, next_chunk0))
+            if iter_idx + 4 < total_iterations and depth_next1 <= 2:
+                shallow_queue.append((depth_next1, buf_next1, next_chunk1))
+            if iter_idx + 5 < total_iterations and depth_next2 <= 2:
+                shallow_queue.append((depth_next2, buf_next2, next_chunk2))
+            pending_shallow = emit_all_shallow_interleaved(shallow_queue)
+            shallow_idx = 0
 
             # Hash stages with gather interleaving for next triple (no more idx/val loading!)
             for stage in range(6):
@@ -537,6 +710,10 @@ class KernelBuilder:
                         instrs.append(("load", ("load", buf_next2[0] + 4, buf_next2[3][4])))
                         instrs.append(("load", ("load", buf_next2[0] + 5, buf_next2[3][5])))
 
+                # Emit previous triple's idx steps 1-4 during stages 0-3
+                if prev_idx_steps and stage < 4:
+                    instrs.extend(prev_idx_steps[stage + 1])
+
                 # Hash final ops for all 3 chunks (None for fused stages)
                 final_op = emit_hash_stage_final_op(buf0, chunk0, stage)
                 if final_op:
@@ -550,37 +727,36 @@ class KernelBuilder:
                     if final_op:
                         instrs.append(final_op)
 
+                # Fill remaining VALU slots with shallow ops (3 slots available per stage)
+                slots_available = 3
+                while slots_available > 0 and shallow_idx < len(pending_shallow):
+                    instrs.append(pending_shallow[shallow_idx])
+                    shallow_idx += 1
+                    slots_available -= 1
+
             # Finish loading remaining gathers for next triple (skip for depths 0-2)
             if iter_idx + 5 < total_iterations and depth_next2 > 2:
                 instrs.append(("load", ("load", buf_next2[0] + 6, buf_next2[3][6])))
                 instrs.append(("load", ("load", buf_next2[0] + 7, buf_next2[3][7])))
 
-            # Shallow node val for depths 0-2 chunks of next triple
-            if has_next_triple and depth_next0 == 0:
-                instrs.extend(emit_shallow_d0(buf_next0))
-            elif has_next_triple and depth_next0 == 1:
-                instrs.extend(emit_shallow_d1(buf_next0, next_chunk0))
-            elif has_next_triple and depth_next0 == 2:
-                instrs.extend(emit_shallow_d2(buf_next0, next_chunk0))
-            if iter_idx + 4 < total_iterations and depth_next1 == 0:
-                instrs.extend(emit_shallow_d0(buf_next1))
-            elif iter_idx + 4 < total_iterations and depth_next1 == 1:
-                instrs.extend(emit_shallow_d1(buf_next1, next_chunk1))
-            elif iter_idx + 4 < total_iterations and depth_next1 == 2:
-                instrs.extend(emit_shallow_d2(buf_next1, next_chunk1))
-            if iter_idx + 5 < total_iterations and depth_next2 == 0:
-                instrs.extend(emit_shallow_d0(buf_next2))
-            elif iter_idx + 5 < total_iterations and depth_next2 == 1:
-                instrs.extend(emit_shallow_d1(buf_next2, next_chunk2))
-            elif iter_idx + 5 < total_iterations and depth_next2 == 2:
-                instrs.extend(emit_shallow_d2(buf_next2, next_chunk2))
+            # Emit any remaining shallow ops (that didn't fit in hash stages)
+            while shallow_idx < len(pending_shallow):
+                instrs.append(pending_shallow[shallow_idx])
+                shallow_idx += 1
 
-            # Index computation for all 3 chunks (operates directly on scratch arrays)
-            instrs.extend(emit_idx_ops(buf0, chunk0))
+            # Index computation for all 3 chunks - DEFERRED for overlap with next triple
+            # Use s_idx_tmp (scratch-based temps) instead of buf[1] to avoid buffer conflicts
+            chunks_info = []
+            v_idx0, v_val0 = get_scratch_addrs(chunk0)
+            chunks_info.append((v_idx0, v_val0, s_idx_tmp + chunk0 * VLEN))
             if has_second:
-                instrs.extend(emit_idx_ops(buf1, chunk1))
+                v_idx1, v_val1 = get_scratch_addrs(chunk1)
+                chunks_info.append((v_idx1, v_val1, s_idx_tmp + chunk1 * VLEN))
             if has_third:
-                instrs.extend(emit_idx_ops(buf2, chunk2))
+                v_idx2, v_val2 = get_scratch_addrs(chunk2)
+                chunks_info.append((v_idx2, v_val2, s_idx_tmp + chunk2 * VLEN))
+            # Save for next iteration - will be emitted overlapped with next triple's execution
+            prev_idx_steps = emit_idx_ops_by_step(chunks_info)
 
             # NO PER-ITERATION STORES! Data stays in scratch arrays
 
@@ -591,6 +767,11 @@ class KernelBuilder:
                 iter_idx += 2
             else:
                 iter_idx += 1
+
+        # Emit last triple's idx ops (no next triple to overlap with)
+        if prev_idx_steps:
+            for step_ops in prev_idx_steps:
+                instrs.extend(step_ops)
 
         # EPILOGUE: Store ALL idx/val from scratch back to memory (32 vstores each)
         # Phase 1: Compute ALL store addresses (64 ALU ops, packs to ~6 cycles)
